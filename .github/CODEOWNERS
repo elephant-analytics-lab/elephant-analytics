@@ -1,0 +1,3 @@
+/api/   @platform-owner
+/web*/  @frontend-owner
+/docs/  @docs-owner

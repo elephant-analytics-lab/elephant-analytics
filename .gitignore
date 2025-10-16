@@ -1,0 +1,8 @@
+/storage/
+/data/
+/models/
+.env
+__pycache__/
+*.pyc
+node_modules/
+.DS_Store
