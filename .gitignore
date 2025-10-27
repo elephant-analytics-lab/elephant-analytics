@@ -17,3 +17,6 @@ models/*.pt
 .DS_Store
 .idea/
 .vscode/
+
+echo !data/.gitkeep>> .gitignore
+echo !models/.gitkeep>> .gitignore
