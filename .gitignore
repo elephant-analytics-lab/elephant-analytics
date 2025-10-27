@@ -1,8 +1,19 @@
-/storage/
-/data/
-/models/
-.env
+# Python
 __pycache__/
 *.pyc
-node_modules/
+.venv/
+.env
+
+# Local data & models
+data/
+models/*.pt
+
+# Outputs
+*.mp4
+*.csv
+*.json
+
+# Editors/OS
 .DS_Store
+.idea/
+.vscode/

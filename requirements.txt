@@ -1,0 +1,9 @@
+streamlit
+fastapi
+uvicorn[standard]
+celery
+opencv-python-headless
+ultralytics
+numpy
+pandas
+plotly
