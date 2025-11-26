@@ -1,9 +1,21 @@
+# Frontend
 streamlit
+requests
+plotly
+pandas
+numpy
+
+# Backend API
 fastapi
 uvicorn[standard]
-celery
+python-multipart  # required for file uploads (multipart/form-data)
+
+# CV/ML
 opencv-python-headless
 ultralytics
-numpy
-pandas
-plotly
+torch
+torchvision
+
+# (Optional) Task queue
+celery
+redis

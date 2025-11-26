@@ -1,22 +1,28 @@
-# Python
-__pycache__/
-*.pyc
+# venv & local settings
 .venv/
 .env
+__pycache__/
+*.py[cod]
+*.log
 
-# Local data & models
-data/
-models/*.pt
-
-# Outputs
-*.mp4
-*.csv
-*.json
-
-# Editors/OS
-.DS_Store
-.idea/
+# Editor/OS
 .vscode/
+.DS_Store
+Thumbs.db
 
-echo !data/.gitkeep>> .gitignore
-echo !models/.gitkeep>> .gitignore
+# Archives
+*.zip
+
+# Backend artifacts (outputs created at runtime)
+backend/app/storage/
+
+# Model weights / big binaries (downloaded at runtime)
+*.pt
+*.onnx
+*.pb
+*.engine
+*.trt
+*.h5
+
+# Streamlit cache
+.streamlit/
