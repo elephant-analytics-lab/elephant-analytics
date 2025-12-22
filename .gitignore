@@ -24,3 +24,7 @@ echo !models/.gitkeep>> .gitignore
 Labelled Data/datasets/
 Labelled Data/runs/
 *.log
+# YOLO training artifacts
+Labelled Data/datasets/
+Labelled Data/runs/
+*.log
