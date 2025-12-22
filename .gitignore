@@ -20,3 +20,7 @@ models/*.pt
 
 echo !data/.gitkeep>> .gitignore
 echo !models/.gitkeep>> .gitignore
+# YOLO training artifacts
+Labelled Data/datasets/
+Labelled Data/runs/
+*.log

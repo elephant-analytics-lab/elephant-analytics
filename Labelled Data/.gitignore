@@ -1,0 +1,4 @@
+# YOLO training artifacts
+Labelled Data/datasets/
+Labelled Data/runs/
+*.log
