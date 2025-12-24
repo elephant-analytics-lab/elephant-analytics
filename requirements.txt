@@ -7,3 +7,6 @@ ultralytics
 numpy
 pandas
 plotly
+requests          # streamlit frontend calls backend with requests.post(...)
+python-multipart  # FastAPI handling file uploads (video) needs this
+python-dotenv     # (optional) if you want to load .env configs
