@@ -6,17 +6,37 @@ __pycache__/
 
 # Local data & models
 data/
+backend/data/
 models/*.pt
 
-# Outputs
-*.mp4
-*.csv
-*.json
+# Outputs/uploads/artifacts
+data/outputs/
+data/uploads/
+**/*.db
+**/*.mp4
+**/*.mov
+**/*.avi
+**/*.csv
+**/*.zip
+**/*.mbtiles
 
 # Editors/OS
 .DS_Store
 .idea/
 .vscode/
+.streamlit/
 
-echo !data/.gitkeep>> .gitignore
-echo !models/.gitkeep>> .gitignore
+# Keep empty dirs if needed
+!data/.gitkeep
+!models/.gitkeep
+
+# Local tiles
+tiles/
+
+# Local telemetry dumps
+dji_*.txt
+
+# YOLO training artifacts
+Labelled Data/datasets/
+Labelled Data/runs/
+*.log

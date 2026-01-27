@@ -1,0 +1,11 @@
+version: "3.9"
+
+services:
+  tileserver:
+    image: klokantech/tileserver-gl
+    ports:
+      - "8080:80"
+    volumes:
+      - ./tiles:/data
+    command: ["tileserver-gl", "/data/malaysia_sg.mbtiles"]
+    restart: unless-stopped
