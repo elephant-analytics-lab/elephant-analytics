@@ -1,0 +1,48 @@
+version: "3.9"
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: elephant-backend
+    working_dir: /app
+    command: uvicorn backend.app.main:app --host 0.0.0.0 --port 8000
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data
+      - ./models:/app/models
+      - ./runs:/app/runs
+      - ./backend:/app/backend
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: elephant-frontend
+    working_dir: /app
+    command: streamlit run streamlit/app.py --server.address 0.0.0.0 --server.port 8501
+    ports:
+      - "8501:8501"
+    environment:
+      EA_BACKEND_BASE_URL: http://backend:8000
+      EA_TILE_URL: http://tileserver:80/styles/klokantech-basic/{z}/{x}/{y}.png
+    volumes:
+      - ./data:/app/data
+      - ./streamlit:/app/streamlit
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+  tileserver:
+    image: klokantech/tileserver-gl
+    container_name: elephant-tileserver
+    ports:
+      - "8080:80"
+    volumes:
+      - ./tiles:/data
+    command: ["tileserver-gl", "/data/malaysia_sg_z12.mbtiles"]
+    restart: unless-stopped
+

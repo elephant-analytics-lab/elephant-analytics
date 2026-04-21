@@ -8,6 +8,7 @@ __pycache__/
 data/
 backend/data/
 models/*.pt
+models/**/*.pt
 
 # Outputs/uploads/artifacts
 data/outputs/
@@ -39,4 +40,8 @@ dji_*.txt
 # YOLO training artifacts
 Labelled Data/datasets/
 Labelled Data/runs/
+runs/
+.yolo_temp/
+persistent_cache.json
+settings.json
 *.log

@@ -66,6 +66,18 @@ def init_db() -> None:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS habitat_frames (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id TEXT NOT NULL,
+                frame_index INTEGER NOT NULL,
+                habitat_label TEXT NOT NULL,
+                conf REAL NOT NULL,
+                FOREIGN KEY(job_id) REFERENCES jobs(id)
+            )
+            """
+        )
         job_cols = {row["name"] for row in conn.execute("PRAGMA table_info(jobs)")}
         if "processing_started_at" not in job_cols:
             conn.execute("ALTER TABLE jobs ADD COLUMN processing_started_at TEXT")
@@ -152,6 +164,23 @@ def insert_detections(job_id: str, detections: list[dict]) -> None:
         )
 
 
+def insert_habitat_rows(job_id: str, rows: list[dict]) -> None:
+    if not rows:
+        return
+    with _connect() as conn:
+        conn.execute("DELETE FROM habitat_frames WHERE job_id = ?", (job_id,))
+        conn.executemany(
+            """
+            INSERT INTO habitat_frames (job_id, frame_index, habitat_label, conf)
+            VALUES (?, ?, ?, ?)
+            """,
+            [
+                (job_id, int(r["frame_index"]), str(r["habitat_label"]), float(r["conf"]))
+                for r in rows
+            ],
+        )
+
+
 def get_jobs() -> list[dict]:
     with _connect() as conn:
         rows = conn.execute(
@@ -219,6 +248,31 @@ def get_unique_track_count(job_id: str) -> int:
             WHERE job_id = ? AND track_id IS NOT NULL AND track_id != 0
             """,
             (job_id,),
+        ).fetchone()
+    return int(row["cnt"]) if row else 0
+
+
+def get_stable_track_count(
+    job_id: str,
+    min_samples: int = 3,
+    min_avg_conf: float = 0.30,
+) -> int:
+    with _connect() as conn:
+        row = conn.execute(
+            """
+            SELECT COUNT(*) AS cnt
+            FROM (
+                SELECT track_id
+                FROM detections
+                WHERE job_id = ?
+                  AND track_id IS NOT NULL
+                  AND track_id != 0
+                GROUP BY track_id
+                HAVING COUNT(*) >= ?
+                   AND AVG(conf) >= ?
+            ) t
+            """,
+            (job_id, min_samples, min_avg_conf),
         ).fetchone()
     return int(row["cnt"]) if row else 0
 
@@ -310,6 +364,124 @@ def get_timeline(job_id: str) -> list[dict]:
 
 def clear_history() -> None:
     with _connect() as conn:
+        conn.execute("DELETE FROM habitat_frames")
         conn.execute("DELETE FROM gps_points")
         conn.execute("DELETE FROM detections")
         conn.execute("DELETE FROM jobs")
+
+
+def get_jobs_minimal(job_ids: list[str]) -> list[dict]:
+    if not job_ids:
+        return []
+    placeholders = ",".join("?" for _ in job_ids)
+    with _connect() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT id, video_path, gpx_path
+            FROM jobs
+            WHERE id IN ({placeholders})
+            """,
+            job_ids,
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def get_habitat_distribution(job_id: str) -> list[dict]:
+    with _connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT habitat_label, COUNT(*) AS cnt, AVG(conf) AS avg_conf
+            FROM habitat_frames
+            WHERE job_id = ?
+            GROUP BY habitat_label
+            ORDER BY cnt DESC
+            """,
+            (job_id,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def get_habitat_rows(job_id: str) -> list[dict]:
+    with _connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT frame_index, habitat_label, conf
+            FROM habitat_frames
+            WHERE job_id = ?
+            ORDER BY frame_index
+            """,
+            (job_id,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def get_habitat_timeline(job_id: str) -> list[dict]:
+    rows = get_habitat_rows(job_id)
+    if not rows:
+        return []
+
+    segments: list[dict] = []
+    start = int(rows[0]["frame_index"])
+    end = int(rows[0]["frame_index"])
+    label = str(rows[0]["habitat_label"])
+    conf_sum = float(rows[0]["conf"])
+    count = 1
+
+    for row in rows[1:]:
+        frame = int(row["frame_index"])
+        habitat = str(row["habitat_label"])
+        conf = float(row["conf"])
+        if habitat == label:
+            end = frame
+            conf_sum += conf
+            count += 1
+            continue
+        segments.append(
+            {
+                "start": start,
+                "end": end,
+                "habitat": label,
+                "confidence": conf_sum / max(count, 1),
+                "samples": count,
+            }
+        )
+        start = frame
+        end = frame
+        label = habitat
+        conf_sum = conf
+        count = 1
+
+    segments.append(
+        {
+            "start": start,
+            "end": end,
+            "habitat": label,
+            "confidence": conf_sum / max(count, 1),
+            "samples": count,
+        }
+    )
+    return segments
+
+
+def delete_jobs(job_ids: list[str]) -> int:
+    if not job_ids:
+        return 0
+    placeholders = ",".join("?" for _ in job_ids)
+    with _connect() as conn:
+        conn.execute(
+            f"DELETE FROM habitat_frames WHERE job_id IN ({placeholders})",
+            job_ids,
+        )
+        conn.execute(
+            f"DELETE FROM gps_points WHERE job_id IN ({placeholders})",
+            job_ids,
+        )
+        conn.execute(
+            f"DELETE FROM detections WHERE job_id IN ({placeholders})",
+            job_ids,
+        )
+        cur = conn.execute(
+            f"DELETE FROM jobs WHERE id IN ({placeholders})",
+            job_ids,
+        )
+    return int(cur.rowcount or 0)

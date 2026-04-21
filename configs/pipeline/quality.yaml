@@ -1,0 +1,13 @@
+mode: quality
+description: "High-accuracy profile for reporting and audit runs."
+detector:
+  frame_stride: 2
+  video_imgsz: 960
+  video_conf: 0.20
+  video_iou: 0.50
+  write_annotated_frames: true
+  save_every_nth_frame: 1
+  frame_jpeg_quality: 88
+habitat:
+  frame_stride: 1
+  device: auto

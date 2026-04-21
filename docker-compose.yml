@@ -7,5 +7,5 @@ services:
       - "8080:80"
     volumes:
       - ./tiles:/data
-    command: ["tileserver-gl", "/data/malaysia_sg.mbtiles"]
+    command: ["tileserver-gl", "/data/malaysia_sg_z12.mbtiles"]
     restart: unless-stopped

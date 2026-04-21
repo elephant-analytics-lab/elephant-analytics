@@ -1,0 +1,13 @@
+mode: fast_trend
+description: "Speed-focused trend profile (no ByteTrack)."
+detector:
+  frame_stride: 4
+  video_imgsz: 768
+  video_conf: 0.24
+  video_iou: 0.50
+  write_annotated_frames: false
+  save_every_nth_frame: 4
+  frame_jpeg_quality: 75
+habitat:
+  frame_stride: 3
+  device: auto
