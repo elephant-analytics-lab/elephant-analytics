@@ -3,8 +3,10 @@ from __future__ import annotations
 import json
 import logging
 import shutil
+import time
 import uuid
 from pathlib import Path
+from statistics import median
 
 import cv2
 from fastapi import FastAPI, File, HTTPException, UploadFile
@@ -17,7 +19,11 @@ from .pipeline.detector import (
     detect_image,
     get_last_tracking_diagnostics,
 )
-from .pipeline.habitat import available_habitat_model, classify_habitat_frames
+from .pipeline.habitat import (
+    available_habitat_model,
+    classify_habitat_frames,
+    get_last_habitat_diagnostics,
+)
 from .pipeline.processor import extract_gps_points, extract_image_gps_points, write_gpx
 from .storage.db import (
     create_job,
@@ -81,6 +87,59 @@ def _clear_directory_contents(path: Path) -> dict[str, int]:
         except Exception:
             logger.exception("Failed to remove path during clear_history: %s", child)
     return {"files_removed": removed_files, "dirs_removed": removed_dirs}
+
+
+def _build_sampled_visible_count_series(herd_series: list[dict]) -> list[dict]:
+    out: list[dict] = []
+    for row in herd_series:
+        frame_index = int(row.get("frame_index", 0))
+        sampled_visible_count = int(row.get("herd_size", 0) or 0)
+        item = {
+            "frame_index": frame_index,
+            "sampled_visible_count": sampled_visible_count,
+        }
+        if row.get("time_seconds") is not None:
+            item["time_seconds"] = float(row["time_seconds"])
+        out.append(item)
+    return out
+
+
+def _build_confidence_profile(detections: list[dict]) -> dict:
+    confs = []
+    for det in detections:
+        try:
+            confs.append(float(det.get("conf", 0.0)))
+        except Exception:
+            continue
+    if not confs:
+        return {
+            "sample_size": 0,
+            "avg_confidence": 0.0,
+            "median_confidence": 0.0,
+            "high_confidence_share": 0.0,
+        }
+    high_conf = sum(1 for value in confs if value >= 0.75)
+    return {
+        "sample_size": len(confs),
+        "avg_confidence": round(sum(confs) / len(confs), 4),
+        "median_confidence": round(float(median(confs)), 4),
+        "high_confidence_share": round(high_conf / len(confs), 4),
+    }
+
+
+def _build_observed_age_composition(class_rows: list[dict]) -> list[dict]:
+    total = sum(int(row["cnt"]) for row in class_rows) or 0
+    composition = []
+    for row in class_rows:
+        count = int(row["cnt"])
+        composition.append(
+            {
+                "age_class": str(row["cls_label"]),
+                "count": count,
+                "share": round((count / total), 4) if total else 0.0,
+            }
+        )
+    return composition
 
 
 def _remove_job_artifacts(job_ids: list[str], jobs: list[dict]) -> dict[str, int]:
@@ -181,7 +240,10 @@ def process_video(
     update_job(job_id, "processing")
     tracking_diagnostics: dict | None = None
     habitat_rows: list[dict] = []
+    process_timing: dict[str, float] = {}
+    habitat_diagnostics: dict | None = None
     try:
+        process_start = time.perf_counter()
         video_path = Path(job["video_path"])
         if not video_path.exists():
             raise RuntimeError("Video file not found")
@@ -198,16 +260,20 @@ def process_video(
                 write_gpx(points, gpx_path, name=job["filename"])
 
             frames_dir = OUTPUT_DIR / "frames" / job_id
+            t_detect = time.perf_counter()
             detections = detect_and_annotate(
                 video_path,
                 frames_dir,
                 model_key=model_key,
                 pipeline_mode=pipeline_mode,
             )
+            process_timing["detection_stage_s"] = round(time.perf_counter() - t_detect, 4)
             tracking_diagnostics = get_last_tracking_diagnostics()
         else:
             frames_dir = OUTPUT_DIR / "frames" / job_id
+            t_detect = time.perf_counter()
             detections = detect_image(video_path, frames_dir, model_key=model_key)
+            process_timing["detection_stage_s"] = round(time.perf_counter() - t_detect, 4)
             points = extract_image_gps_points(video_path)
             insert_gps_points(job_id, points)
             if points:
@@ -215,13 +281,59 @@ def process_video(
                 write_gpx(points, gpx_path, name=job["filename"])
 
         insert_detections(job_id, detections)
+        t_habitat = time.perf_counter()
         habitat_rows = classify_habitat_frames(frames_dir, pipeline_mode=pipeline_mode)
+        habitat_diagnostics = get_last_habitat_diagnostics()
+        process_timing["habitat_classification_s"] = round(time.perf_counter() - t_habitat, 4)
         insert_habitat_rows(job_id, habitat_rows)
         detections_path = OUTPUT_DIR / f"{job_id}_detections.json"
         detections_path.write_text(
             json.dumps({"job_id": job_id, "detections": detections}, indent=2),
             encoding="utf-8",
         )
+        process_timing["process_total_s"] = round(time.perf_counter() - process_start, 4)
+        if tracking_diagnostics:
+            process_timing["tracking_total_s"] = round(
+                float(tracking_diagnostics.get("tracking_total_s", 0.0)), 4
+            )
+            process_timing["detection_total_s"] = round(
+                float(tracking_diagnostics.get("detection_total_s", 0.0)), 4
+            )
+            process_timing["preview_asset_generation_s"] = round(
+                float(tracking_diagnostics.get("frame_write_total_s", 0.0)), 4
+            )
+            process_timing["sampled_checkpoint_extraction_s"] = round(
+                float(tracking_diagnostics.get("sampled_checkpoint_extraction_s", 0.0)), 4
+            )
+            process_timing["read_s"] = round(
+                float(tracking_diagnostics.get("read_total_s", 0.0)), 4
+            )
+            process_timing["grab_s"] = round(
+                float(tracking_diagnostics.get("grab_total_s", 0.0)), 4
+            )
+            process_timing["annotation_s"] = round(
+                float(tracking_diagnostics.get("frame_annotation_total_s", 0.0)), 4
+            )
+            process_timing["yolo_preprocess_ms_total"] = round(
+                float(tracking_diagnostics.get("yolo_preprocess_ms_total", 0.0)), 4
+            )
+            process_timing["yolo_inference_ms_total"] = round(
+                float(tracking_diagnostics.get("yolo_inference_ms_total", 0.0)), 4
+            )
+            process_timing["yolo_postprocess_ms_total"] = round(
+                float(tracking_diagnostics.get("yolo_postprocess_ms_total", 0.0)), 4
+            )
+            process_timing["frames_saved"] = int(tracking_diagnostics.get("frames_saved", 0))
+        if habitat_diagnostics:
+            process_timing["habitat_predict_s"] = round(
+                float(habitat_diagnostics.get("predict_s", 0.0)), 4
+            )
+            process_timing["habitat_frame_files_used"] = int(
+                habitat_diagnostics.get("frame_files_used", 0)
+            )
+            process_timing["habitat_frame_files_total"] = int(
+                habitat_diagnostics.get("frame_files_total", 0)
+            )
 
         update_job(job_id, "complete", gpx_path=str(gpx_path) if gpx_path else None)
     except Exception as exc:
@@ -238,6 +350,8 @@ def process_video(
         "model_key": model_key,
         "pipeline_mode": pipeline_mode or "default",
         "tracking_diagnostics": tracking_diagnostics,
+        "habitat_diagnostics": habitat_diagnostics,
+        "timings": process_timing,
     }
 
 
@@ -279,9 +393,10 @@ def job_metrics(job_id: str) -> JSONResponse:
     detections_count = get_detection_count(job_id)
     raw_unique_tracks = get_unique_track_count(job_id)
     stable_unique_tracks = get_stable_track_count(job_id, min_samples=3, min_avg_conf=0.30)
+    has_track_ids = (raw_unique_tracks > 0) or (stable_unique_tracks > 0)
     unique_tracks = stable_unique_tracks if stable_unique_tracks > 0 else raw_unique_tracks
-    if unique_tracks == 0:
-        unique_tracks = detections_count
+    if not has_track_ids:
+        unique_tracks = 0
 
     class_rows = get_class_distribution(job_id)
     total = sum(row["cnt"] for row in class_rows) or 0
@@ -300,7 +415,7 @@ def job_metrics(job_id: str) -> JSONResponse:
     # Tracking IDs can fragment when elephants occlude/exit/re-enter.
     # Cap reported population by the observed concurrent peak to avoid
     # over-counting identity fragments as new elephants.
-    if peak_herd_size > 0 and unique_tracks > peak_herd_size:
+    if has_track_ids and peak_herd_size > 0 and unique_tracks > peak_herd_size:
         unique_tracks = peak_herd_size
 
     fps = None
@@ -328,6 +443,87 @@ def job_metrics(job_id: str) -> JSONResponse:
     dominant_habitat_share = habitat_distribution[0]["percentage"] if habitat_distribution else 0.0
     habitat_switches = max(len(habitat_timeline) - 1, 0)
     habitat_coverage = 100.0 if habitat_total > 0 else 0.0
+    t_bundle = time.perf_counter()
+    detections = get_detections(job_id)
+    confidence_profile = _build_confidence_profile(detections)
+    observed_age_composition = _build_observed_age_composition(class_rows)
+    sampled_visible_count_series = _build_sampled_visible_count_series(herd_series)
+    sampled_counts = [row["sampled_visible_count"] for row in sampled_visible_count_series]
+    current_sampled_visible_count = sampled_counts[-1] if sampled_counts else 0
+    min_sampled_visible_count = min(sampled_counts) if sampled_counts else 0
+    peak_sampled_visible_count = max(sampled_counts) if sampled_counts else 0
+    avg_sampled_visible_count = (
+        round(sum(sampled_counts) / len(sampled_counts), 2) if sampled_counts else 0.0
+    )
+    caveats = [
+        "Sampled checkpoint-based value. Not frame-perfect live inference.",
+        "Observed age composition is derived from detections and should be interpreted as sampled observations.",
+        "Without strict identity continuity guarantees, avoid over-interpreting individual-level persistence across the entire video.",
+    ]
+    fast_review_bundle = {
+        "schema_version": "2026-04-21",
+        "naming": {"primary_count_metric": "sampled_visible_count"},
+        "review": {
+            "sampled_visible_count": current_sampled_visible_count,
+            "run_summary": {
+                "detections_count": detections_count,
+                "avg_herd_size": round(avg_herd_size, 2),
+                "peak_herd_size": peak_herd_size,
+            },
+            "run_details": {
+                "fps": fps,
+                "dominant_habitat": dominant_habitat,
+                "dominant_habitat_share": dominant_habitat_share,
+            },
+        },
+        "trend": {
+            "sampled_visible_count_over_time": sampled_visible_count_series,
+            "min_sampled_visible_count": min_sampled_visible_count,
+            "avg_sampled_visible_count": avg_sampled_visible_count,
+            "peak_sampled_visible_count": peak_sampled_visible_count,
+        },
+        "frame_inspection": {
+            "source": "sampled_frames",
+            "detections_available": bool(detections),
+        },
+        "run_diagnostics": {
+            "confidence_profile": confidence_profile,
+            "observed_age_composition": observed_age_composition,
+            "caveats": caveats,
+        },
+        "context": {
+            "habitat_summary": {
+                "dominant_habitat": dominant_habitat,
+                "dominant_habitat_share": dominant_habitat_share,
+                "habitat_switches": habitat_switches,
+                "habitat_coverage": habitat_coverage,
+            },
+            "habitat_timeline": habitat_timeline,
+        },
+    }
+    tracking_bundle = {
+        "schema_version": "2026-04-21",
+        "availability": {
+            "has_tracking_rows": bool(has_track_ids),
+            "has_track_ids": bool(has_track_ids),
+        },
+        "identity_metrics": {
+            "unique_tracks": unique_tracks,
+            "raw_unique_tracks": raw_unique_tracks,
+            "stable_unique_tracks": stable_unique_tracks,
+        },
+        "timeline_hint": {
+            "endpoint": f"/timeline/{job_id}",
+            "note": "Tracking-aware timeline is optional deep analysis and should not block fast review.",
+        },
+    }
+    results_bundle = {
+        "schema_version": "2026-04-21",
+        "naming": {"primary_count_metric": "sampled_visible_count"},
+        "fast_review_bundle": fast_review_bundle,
+        "tracking_bundle": tracking_bundle,
+    }
+    bundle_generation_s = round(time.perf_counter() - t_bundle, 4)
 
     return JSONResponse(
         {
@@ -347,6 +543,10 @@ def job_metrics(job_id: str) -> JSONResponse:
             "dominant_habitat_share": dominant_habitat_share,
             "habitat_switches": habitat_switches,
             "habitat_coverage": habitat_coverage,
+            "fast_review_bundle": fast_review_bundle,
+            "tracking_bundle": tracking_bundle,
+            "results_bundle": results_bundle,
+            "timings": {"bundle_generation_s": bundle_generation_s},
         }
     )
 

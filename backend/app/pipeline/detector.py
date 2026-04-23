@@ -1,4 +1,5 @@
 import os
+import time
 from pathlib import Path
 
 import cv2
@@ -57,7 +58,7 @@ PIPELINE_MODE_PRESETS: dict[str, dict[str, object]] = {
         "write_annotated_frames": True,
         "save_every_nth_frame": 2,
         "frame_jpeg_quality": 80,
-        "use_tracker": True,
+        "use_tracker": False,
         "target_sample_fps": 2.0,
     },
     "fast_trend": {
@@ -68,7 +69,7 @@ PIPELINE_MODE_PRESETS: dict[str, dict[str, object]] = {
         "write_annotated_frames": True,
         "save_every_nth_frame": 2,
         "frame_jpeg_quality": 80,
-        "use_tracker": True,
+        "use_tracker": False,
         "target_sample_fps": 2.0,
     },
     "quality": {
@@ -136,6 +137,40 @@ def _save_frame(frame_path: Path, frame: np.ndarray, jpeg_quality: int | None = 
     quality = int(jpeg_quality if jpeg_quality is not None else FRAME_JPEG_QUALITY)
     quality = max(40, min(100, quality))
     cv2.imwrite(str(frame_path), frame, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
+
+
+def _draw_detection_lightweight(
+    frame: np.ndarray,
+    box: np.ndarray,
+    label_text: str,
+    color: tuple[int, int, int] = (96, 165, 250),
+) -> None:
+    x1, y1, x2, y2 = [int(v) for v in box.tolist()]
+    h, w = frame.shape[:2]
+    x1 = max(0, min(w - 1, x1))
+    y1 = max(0, min(h - 1, y1))
+    x2 = max(0, min(w - 1, x2))
+    y2 = max(0, min(h - 1, y2))
+    if x2 <= x1 or y2 <= y1:
+        return
+    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+    text = str(label_text)[:32]
+    (tw, th), baseline = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
+    tx1 = x1
+    ty2 = max(th + baseline + 2, y1)
+    ty1 = max(0, ty2 - (th + baseline + 4))
+    tx2 = min(w - 1, tx1 + tw + 8)
+    cv2.rectangle(frame, (tx1, ty1), (tx2, ty2), color, -1)
+    cv2.putText(
+        frame,
+        text,
+        (tx1 + 4, ty2 - baseline - 1),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.45,
+        (20, 20, 20),
+        1,
+        cv2.LINE_AA,
+    )
 
 
 def _resolve_runtime_video_config(pipeline_mode: str | None) -> dict[str, object]:
@@ -1043,7 +1078,7 @@ def detect_and_annotate(
     prev_ids: list[int] = []
     prev_cls_ids: list[int] = []
     next_id = 1
-    tracker_mode = TRACKER_ALGO if run_use_tracker else "iou"
+    tracker_mode = TRACKER_ALGO if run_use_tracker else "none"
     tracker_warned = False
     raw_to_canonical: dict[int, int] = {}
     canonical_to_display: dict[int, int] = {}
@@ -1063,19 +1098,32 @@ def detect_and_annotate(
         "tail_new_id_suppressed": 0,
         "id_switch_overrides": 0,
     }
+    detection_total_s = 0.0
+    tracking_total_s = 0.0
+    frame_write_total_s = 0.0
+    frame_annotation_total_s = 0.0
+    read_total_s = 0.0
+    grab_total_s = 0.0
+    yolo_preprocess_ms_total = 0.0
+    yolo_inference_ms_total = 0.0
+    yolo_postprocess_ms_total = 0.0
+    frames_saved = 0
     fallback_used = False
 
     frame_index = 0
     end_of_stream = False
     while not end_of_stream:
+        t_read = time.perf_counter()
         ret, frame = cap.read()
+        read_total_s += time.perf_counter() - t_read
         if not ret:
             break
         diag["frames_read"] = int(diag["frames_read"]) + 1
         diag["frames_sampled"] = int(diag["frames_sampled"]) + 1
 
-        if tracker_mode in {"bytetrack", "botsort"}:
+        if run_use_tracker and tracker_mode in {"bytetrack", "botsort"}:
             try:
+                t_infer = time.perf_counter()
                 results = model.track(
                     source=frame,
                     verbose=False,
@@ -1087,6 +1135,9 @@ def detect_and_annotate(
                     iou=run_video_iou,
                     imgsz=run_video_imgsz,
                 )
+                infer_elapsed = time.perf_counter() - t_infer
+                detection_total_s += infer_elapsed
+                tracking_total_s += infer_elapsed
             except Exception:
                 # Fall back to existing IoU tracking if ByteTrack is unavailable in runtime.
                 tracker_mode = "iou"
@@ -1094,6 +1145,7 @@ def detect_and_annotate(
                 if not tracker_warned:
                     print("Tracker unavailable; falling back to IoU tracking.")
                     tracker_warned = True
+                t_infer = time.perf_counter()
                 results = model.predict(
                     source=frame,
                     verbose=False,
@@ -1103,7 +1155,9 @@ def detect_and_annotate(
                     iou=run_video_iou,
                     imgsz=run_video_imgsz,
                 )
+                detection_total_s += time.perf_counter() - t_infer
         else:
+            t_infer = time.perf_counter()
             results = model.predict(
                 source=frame,
                 verbose=False,
@@ -1113,7 +1167,9 @@ def detect_and_annotate(
                 iou=run_video_iou,
                 imgsz=run_video_imgsz,
             )
-            diag["fallback_iou_frames"] = int(diag["fallback_iou_frames"]) + 1
+            detection_total_s += time.perf_counter() - t_infer
+            if run_use_tracker:
+                diag["fallback_iou_frames"] = int(diag["fallback_iou_frames"]) + 1
         if not results:
             # Old behavior decoded every frame then skipped by modulo.
             # We now fast-skip intermediate frames with grab() to reduce decode overhead
@@ -1130,6 +1186,10 @@ def detect_and_annotate(
             continue
 
         res = results[0]
+        speed = getattr(res, "speed", None) or {}
+        yolo_preprocess_ms_total += float(speed.get("preprocess", 0.0) or 0.0)
+        yolo_inference_ms_total += float(speed.get("inference", 0.0) or 0.0)
+        yolo_postprocess_ms_total += float(speed.get("postprocess", 0.0) or 0.0)
         names = res.names or {}
         if len(res.boxes) > 0:
             diag["frames_with_detections"] = int(diag["frames_with_detections"]) + 1
@@ -1149,7 +1209,58 @@ def detect_and_annotate(
             )
             for b in res.boxes
         ]
+        if not run_use_tracker:
+            for box in res.boxes:
+                cls_id = int(box.cls[0]) if box.cls is not None else -1
+                conf = float(box.conf[0]) if box.conf is not None else 0.0
+                xyxy = np.array(box.xyxy[0].tolist(), dtype=np.float32)
+                detections.append(
+                    {
+                        "frame_index": frame_index,
+                        "track_id": None,
+                        "cls_id": cls_id,
+                        "cls_label": names.get(cls_id),
+                        "conf": conf,
+                        "x1": float(xyxy[0]),
+                        "y1": float(xyxy[1]),
+                        "x2": float(xyxy[2]),
+                        "y2": float(xyxy[3]),
+                    }
+                )
+                if run_write_annotated:
+                    t_annot = time.perf_counter()
+                    _draw_detection_lightweight(
+                        frame,
+                        box=xyxy,
+                        label_text=f"Elephant {_format_age_label(names.get(cls_id), cls_id)}",
+                        color=(96, 165, 250),
+                    )
+                    frame_annotation_total_s += time.perf_counter() - t_annot
+            if (frame_index % run_save_every_nth) == 0:
+                frame_path = output_dir / f"frame_{frame_index:06d}.jpg"
+                t_write = time.perf_counter()
+                _save_frame(frame_path, frame, jpeg_quality=run_jpeg_quality)
+                frame_write_total_s += time.perf_counter() - t_write
+                frames_saved += 1
+            prev_boxes = []
+            prev_ids = []
+            prev_cls_ids = []
+            skipped = 0
+            for _ in range(max(stride - 1, 0)):
+                t_grab = time.perf_counter()
+                if not cap.grab():
+                    grab_total_s += time.perf_counter() - t_grab
+                    end_of_stream = True
+                    break
+                grab_total_s += time.perf_counter() - t_grab
+                skipped += 1
+            if skipped:
+                diag["frames_read"] = int(diag["frames_read"]) + skipped
+            frame_index += 1 + skipped
+            continue
+
         for box in res.boxes:
+            t_track_logic = time.perf_counter()
             cls_id = int(box.cls[0]) if box.cls is not None else -1
             conf = float(box.conf[0]) if box.conf is not None else 0.0
             xyxy = np.array(box.xyxy[0].tolist(), dtype=np.float32)
@@ -1264,8 +1375,10 @@ def detect_and_annotate(
                     "y2": float(xyxy[3]),
                 }
             )
+            tracking_total_s += time.perf_counter() - t_track_logic
 
             if run_write_annotated:
+                t_annot = time.perf_counter()
                 _draw_detection_card(
                     frame,
                     box=xyxy,
@@ -1274,25 +1387,38 @@ def detect_and_annotate(
                     occupied_tag_rects=occupied_tag_rects,
                     avoid_rects=frame_detection_rects,
                 )
+                frame_annotation_total_s += time.perf_counter() - t_annot
 
         if (frame_index % run_save_every_nth) == 0:
             frame_path = output_dir / f"frame_{frame_index:06d}.jpg"
+            t_write = time.perf_counter()
             _save_frame(frame_path, frame, jpeg_quality=run_jpeg_quality)
+            frame_write_total_s += time.perf_counter() - t_write
+            frames_saved += 1
 
         prev_boxes = frame_boxes
         prev_ids = frame_ids
         prev_cls_ids = frame_cls_ids
         skipped = 0
         for _ in range(max(stride - 1, 0)):
+            t_grab = time.perf_counter()
             if not cap.grab():
+                grab_total_s += time.perf_counter() - t_grab
                 end_of_stream = True
                 break
+            grab_total_s += time.perf_counter() - t_grab
             skipped += 1
         if skipped:
             diag["frames_read"] = int(diag["frames_read"]) + skipped
         frame_index += 1 + skipped
 
     cap.release()
+    t_checkpoint = time.perf_counter()
+    checkpoint_counts: dict[int, int] = {}
+    for det in detections:
+        idx = int(det.get("frame_index", 0))
+        checkpoint_counts[idx] = int(checkpoint_counts.get(idx, 0)) + 1
+    sampled_checkpoint_extraction_s = time.perf_counter() - t_checkpoint
     LAST_TRACKING_DIAGNOSTICS.clear()
     LAST_TRACKING_DIAGNOSTICS.update(
         {
@@ -1314,6 +1440,17 @@ def detect_and_annotate(
             "raw_bytetrack_ids_seen": len(raw_bytetrack_ids_seen),
             "canonical_ids_seen": len(canonical_last_seen),
             "max_display_id_seen": max(display_last_seen.keys()) if display_last_seen else 0,
+            "detection_total_s": round(detection_total_s, 4),
+            "tracking_total_s": round(tracking_total_s, 4),
+            "frame_write_total_s": round(frame_write_total_s, 4),
+            "frame_annotation_total_s": round(frame_annotation_total_s, 4),
+            "read_total_s": round(read_total_s, 4),
+            "grab_total_s": round(grab_total_s, 4),
+            "yolo_preprocess_ms_total": round(yolo_preprocess_ms_total, 4),
+            "yolo_inference_ms_total": round(yolo_inference_ms_total, 4),
+            "yolo_postprocess_ms_total": round(yolo_postprocess_ms_total, 4),
+            "frames_saved": int(frames_saved),
+            "sampled_checkpoint_extraction_s": round(sampled_checkpoint_extraction_s, 4),
             **{k: int(v) for k, v in diag.items()},
         }
     )
