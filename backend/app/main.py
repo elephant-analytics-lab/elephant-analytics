@@ -5,18 +5,21 @@ import logging
 import shutil
 import time
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 from statistics import median
 
 import cv2
 from fastapi import FastAPI, File, HTTPException, UploadFile
-from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
 from .pipeline.detector import (
     available_models,
     detect_and_annotate,
     detect_image,
+    estimate_sampled_frame_target,
     get_last_tracking_diagnostics,
 )
 from .pipeline.habitat import (
@@ -45,6 +48,7 @@ from .storage.db import (
     insert_habitat_rows,
     insert_gps_points,
     update_job,
+    clear_job_data,
     clear_history,
     delete_jobs,
 )
@@ -57,6 +61,13 @@ MAX_UPLOAD_BYTES = 1024 * 1024 * 1024 * 4  # 4 GB
 
 app = FastAPI(title="Elephant Analytics API", version="0.1.0")
 logger = logging.getLogger("elephant-analytics")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 def _get_video_fps(path: Path) -> float | None:
@@ -87,6 +98,21 @@ def _clear_directory_contents(path: Path) -> dict[str, int]:
         except Exception:
             logger.exception("Failed to remove path during clear_history: %s", child)
     return {"files_removed": removed_files, "dirs_removed": removed_dirs}
+
+
+def _frame_index_from_name(path: Path) -> int | None:
+    stem = path.stem
+    if "_" not in stem:
+        return None
+    raw = stem.rsplit("_", 1)[-1]
+    return int(raw) if raw.isdigit() else None
+
+
+def _get_frame_files(job_id: str) -> list[Path]:
+    frames_dir = OUTPUT_DIR / "frames" / job_id
+    if not frames_dir.exists() or not frames_dir.is_dir():
+        return []
+    return sorted(frames_dir.glob("frame_*.jpg"))
 
 
 def _build_sampled_visible_count_series(herd_series: list[dict]) -> list[dict]:
@@ -182,6 +208,34 @@ class DeleteJobsRequest(BaseModel):
     job_ids: list[str]
 
 
+class ProcessingCancelled(RuntimeError):
+    pass
+
+
+def _is_job_cancel_requested(job_id: str) -> bool:
+    job = get_job(job_id)
+    if not job:
+        return False
+    return str(job.get("status") or "").lower() == "cancel_requested"
+
+
+def _cancel_check(job_id: str) -> Callable[[], bool]:
+    return lambda: _is_job_cancel_requested(job_id)
+
+
+def _cleanup_cancelled_job(job_id: str) -> None:
+    clear_job_data(job_id)
+    frames_dir = OUTPUT_DIR / "frames" / job_id
+    if frames_dir.exists() and frames_dir.is_dir():
+        shutil.rmtree(frames_dir, ignore_errors=True)
+    gpx_path = OUTPUT_DIR / f"{job_id}.gpx"
+    if gpx_path.exists():
+        gpx_path.unlink(missing_ok=True)
+    detections_path = OUTPUT_DIR / f"{job_id}_detections.json"
+    if detections_path.exists():
+        detections_path.unlink(missing_ok=True)
+
+
 @app.on_event("startup")
 def _startup() -> None:
     init_db()
@@ -236,12 +290,16 @@ def process_video(
     job = get_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+    if str(job.get("status") or "").lower() == "cancel_requested":
+        update_job(job_id, "cancelled", message="Processing cancelled.")
+        raise HTTPException(status_code=409, detail="Job was cancelled before processing started")
 
-    update_job(job_id, "processing")
+    update_job(job_id, "processing", model_key=model_key, pipeline_mode=pipeline_mode)
     tracking_diagnostics: dict | None = None
     habitat_rows: list[dict] = []
     process_timing: dict[str, float] = {}
     habitat_diagnostics: dict | None = None
+    should_cancel = _cancel_check(job_id)
     try:
         process_start = time.perf_counter()
         video_path = Path(job["video_path"])
@@ -266,6 +324,7 @@ def process_video(
                 frames_dir,
                 model_key=model_key,
                 pipeline_mode=pipeline_mode,
+                should_cancel=should_cancel,
             )
             process_timing["detection_stage_s"] = round(time.perf_counter() - t_detect, 4)
             tracking_diagnostics = get_last_tracking_diagnostics()
@@ -280,11 +339,19 @@ def process_video(
                 gpx_path = OUTPUT_DIR / f"{job_id}.gpx"
                 write_gpx(points, gpx_path, name=job["filename"])
 
+        if should_cancel():
+            raise ProcessingCancelled("Processing cancelled")
         insert_detections(job_id, detections)
         t_habitat = time.perf_counter()
-        habitat_rows = classify_habitat_frames(frames_dir, pipeline_mode=pipeline_mode)
+        habitat_rows = classify_habitat_frames(
+            frames_dir,
+            pipeline_mode=pipeline_mode,
+            should_cancel=should_cancel,
+        )
         habitat_diagnostics = get_last_habitat_diagnostics()
         process_timing["habitat_classification_s"] = round(time.perf_counter() - t_habitat, 4)
+        if should_cancel():
+            raise ProcessingCancelled("Processing cancelled")
         insert_habitat_rows(job_id, habitat_rows)
         detections_path = OUTPUT_DIR / f"{job_id}_detections.json"
         detections_path.write_text(
@@ -335,10 +402,26 @@ def process_video(
                 habitat_diagnostics.get("frame_files_total", 0)
             )
 
-        update_job(job_id, "complete", gpx_path=str(gpx_path) if gpx_path else None)
+        update_job(
+            job_id,
+            "complete",
+            gpx_path=str(gpx_path) if gpx_path else None,
+            model_key=model_key,
+            pipeline_mode=pipeline_mode,
+        )
+    except ProcessingCancelled as exc:
+        logger.info("Processing cancelled for job_id=%s", job_id)
+        _cleanup_cancelled_job(job_id)
+        update_job(job_id, "cancelled", message=str(exc), model_key=model_key, pipeline_mode=pipeline_mode)
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except Exception as exc:
+        if str(exc) == "Processing cancelled":
+            logger.info("Processing cancelled for job_id=%s", job_id)
+            _cleanup_cancelled_job(job_id)
+            update_job(job_id, "cancelled", message=str(exc), model_key=model_key, pipeline_mode=pipeline_mode)
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         logger.exception("Processing failed for job_id=%s", job_id)
-        update_job(job_id, "failed", message=str(exc))
+        update_job(job_id, "failed", message=str(exc), model_key=model_key, pipeline_mode=pipeline_mode)
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     return {
@@ -353,6 +436,20 @@ def process_video(
         "habitat_diagnostics": habitat_diagnostics,
         "timings": process_timing,
     }
+
+
+@app.post("/jobs/{job_id}/cancel")
+def cancel_job(job_id: str) -> dict:
+    job = get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    status = str(job.get("status") or "").lower()
+    if status in {"complete", "failed", "cancelled"}:
+        return {"job_id": job_id, "status": status, "cancelled": False}
+
+    update_job(job_id, "cancel_requested", message="Cancellation requested by client.")
+    return {"job_id": job_id, "status": "cancel_requested", "cancelled": True}
 
 
 @app.get("/models")
@@ -373,6 +470,70 @@ def job_results(job_id: str) -> JSONResponse:
     points = get_gps_points(job_id)
     detections_count = get_detection_count(job_id)
     return JSONResponse({"job": job, "gps": points, "detections_count": detections_count})
+
+
+@app.get("/media/preview/{job_id}/meta")
+def media_preview_meta(job_id: str, pipeline_mode: str | None = None) -> JSONResponse:
+    job = get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    frame_files = _get_frame_files(job_id)
+    video_path = Path(job["video_path"])
+    suffix = video_path.suffix.lower()
+    estimated_targets: dict[str, float | int] = {
+        "total_frames": 0,
+        "source_fps": 0.0,
+        "frame_stride": 1,
+        "save_every_nth_frame": 1,
+        "sampled_frame_target": 0,
+        "saved_frame_target": 0,
+    }
+    try:
+        if suffix in {".mp4", ".mov", ".avi"}:
+            estimated_targets = estimate_sampled_frame_target(
+                video_path,
+                pipeline_mode=pipeline_mode,
+            )
+    except Exception:
+        logger.exception("Failed estimating preview targets for job_id=%s", job_id)
+
+    if not frame_files:
+        return JSONResponse(
+            {
+                "job_id": job_id,
+                "frame_indices": [],
+                "frame_count": 0,
+                "preview_fps": 12,
+                "has_frames": False,
+                **estimated_targets,
+            }
+        )
+
+    frame_indices = [idx for idx in (_frame_index_from_name(path) for path in frame_files) if idx is not None]
+
+    return JSONResponse(
+        {
+            "job_id": job_id,
+            "frame_indices": frame_indices,
+            "frame_count": len(frame_indices),
+            "preview_fps": 12,
+            "has_frames": bool(frame_indices),
+            **estimated_targets,
+        }
+    )
+
+
+@app.get("/media/frame/{job_id}/{frame_index}")
+def media_frame(job_id: str, frame_index: int) -> FileResponse:
+    job = get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    frame_path = OUTPUT_DIR / "frames" / job_id / f"frame_{frame_index:06d}.jpg"
+    if not frame_path.exists() or not frame_path.is_file():
+        raise HTTPException(status_code=404, detail="Frame not found")
+    return FileResponse(frame_path)
 
 
 @app.get("/timeline/{job_id}")

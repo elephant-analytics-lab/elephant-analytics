@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 from ultralytics import YOLO
@@ -105,8 +106,14 @@ def _frame_index_from_name(path: Path) -> int:
     return int(idx) if idx.isdigit() else 0
 
 
-def classify_habitat_frames(frames_dir: Path, pipeline_mode: str | None = None) -> list[dict]:
+def classify_habitat_frames(
+    frames_dir: Path,
+    pipeline_mode: str | None = None,
+    should_cancel: Callable[[], bool] | None = None,
+) -> list[dict]:
     t_total = time.perf_counter()
+    if should_cancel and should_cancel():
+        raise RuntimeError("Processing cancelled")
     model_path = resolve_habitat_model_path()
     if model_path is None:
         LAST_HABITAT_DIAGNOSTICS.clear()
@@ -151,6 +158,8 @@ def classify_habitat_frames(frames_dir: Path, pipeline_mode: str | None = None) 
     inference_ms = 0.0
     postprocess_ms = 0.0
     for frame_path, res in zip(frame_paths, results):
+        if should_cancel and should_cancel():
+            raise RuntimeError("Processing cancelled")
         probs = getattr(res, "probs", None)
         names = getattr(res, "names", None) or {}
         speed = getattr(res, "speed", None) or {}

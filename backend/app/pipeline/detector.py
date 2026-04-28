@@ -1,5 +1,6 @@
 import os
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 import cv2
@@ -82,28 +83,6 @@ PIPELINE_MODE_PRESETS: dict[str, dict[str, object]] = {
         "frame_jpeg_quality": 88,
         "use_tracker": True,
         "target_sample_fps": 0.0,
-    },
-    "value_1x": {
-        "frame_stride": 6,
-        "video_imgsz": 832,
-        "video_conf": 0.22,
-        "video_iou": 0.50,
-        "write_annotated_frames": True,
-        "save_every_nth_frame": 2,
-        "frame_jpeg_quality": 80,
-        "use_tracker": True,
-        "target_sample_fps": 5.0,
-    },
-    "balanced_2fps": {
-        "frame_stride": 2,
-        "video_imgsz": 832,
-        "video_conf": 0.22,
-        "video_iou": 0.50,
-        "write_annotated_frames": True,
-        "save_every_nth_frame": 2,
-        "frame_jpeg_quality": 80,
-        "use_tracker": True,
-        "target_sample_fps": 2.0,
     },
 }
 
@@ -202,6 +181,46 @@ def _resolve_runtime_video_config(pipeline_mode: str | None) -> dict[str, object
     return cfg
 
 
+def estimate_sampled_frame_target(
+    video_path: Path,
+    pipeline_mode: str | None = None,
+) -> dict[str, float | int]:
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise RuntimeError("Failed to open video")
+    try:
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        video_fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+    finally:
+        cap.release()
+
+    runtime_cfg = _resolve_runtime_video_config(pipeline_mode)
+    stride = int(runtime_cfg["frame_stride"])
+    run_target_sample_fps = float(runtime_cfg["target_sample_fps"])
+    run_save_every_nth = int(runtime_cfg["save_every_nth_frame"])
+
+    if run_target_sample_fps > 0 and video_fps > 0:
+        stride = max(1, int(round(video_fps / run_target_sample_fps)))
+    if total_frames and total_frames <= SHORT_VIDEO_MAX_FRAMES:
+        stride = 1
+
+    sampled_frames = 0
+    if total_frames > 0:
+        sampled_frames = ((total_frames - 1) // stride) + 1
+    saved_frames = 0
+    if sampled_frames > 0:
+        saved_frames = ((sampled_frames - 1) // max(1, run_save_every_nth)) + 1
+
+    return {
+        "total_frames": total_frames,
+        "source_fps": video_fps,
+        "frame_stride": stride,
+        "save_every_nth_frame": run_save_every_nth,
+        "sampled_frame_target": sampled_frames,
+        "saved_frame_target": saved_frames,
+    }
+
+
 def _format_age_label(cls_label: object, cls_id: int) -> str:
     txt = str(cls_label or "").strip().lower()
     if "baby" in txt or "calf" in txt:
@@ -231,44 +250,6 @@ PHOTO_SETTINGS = {
         "strict_area_ratio": 0.7,
         "tile_enabled": False,
         "tile_overlap": 0.2,
-    },
-    "default_v4": {
-        "conf": 0.32,
-        "non_baby_min_conf": 0.32,
-        "baby_min_conf": 0.32,
-        "iou": 0.42,
-        "imgsz": 640,
-        "duplicate_iou": 0.7,
-        "cross_class_duplicate_iou": 1.01,
-        "cross_class_max_conf": -1.0,
-        "cross_class_confidence_gap": 1.0,
-        "center_distance": 0.2,
-        "min_area_ratio": 0.5,
-        "confidence_gap": 0.08,
-        "strict_duplicate_iou": 0.9,
-        "strict_center_distance": 0.08,
-        "strict_area_ratio": 0.7,
-        "tile_enabled": False,
-        "tile_overlap": 0.2,
-    },
-    "labeling_data_v1": {
-        "conf": 0.28,
-        "non_baby_min_conf": 0.28,
-        "baby_min_conf": 0.28,
-        "iou": 0.45,
-        "imgsz": 960,
-        "duplicate_iou": 0.8,
-        "cross_class_duplicate_iou": 1.01,
-        "cross_class_max_conf": -1.0,
-        "cross_class_confidence_gap": 1.0,
-        "center_distance": 0.14,
-        "min_area_ratio": 0.62,
-        "confidence_gap": 0.12,
-        "strict_duplicate_iou": 0.88,
-        "strict_center_distance": 0.08,
-        "strict_area_ratio": 0.72,
-        "tile_enabled": False,
-        "tile_overlap": 0.25,
     },
     "labeling_data_v2_s": {
         "conf": 0.16,
@@ -391,10 +372,10 @@ PHOTO_SETTINGS_DEFAULTS = {
     "border_low_conf_max": -1.0,
 }
 
+# Keep the registry aligned with the two customer-facing model choices.
+# Legacy aliases stay mapped so older saved jobs can still resolve the same file.
 MODEL_REGISTRY = {
-    "default_v4": BASE_DIR / "models" / "elephant_v1_trained_yolov8n_v4.pt",
     "best": BASE_DIR / "models" / "best.pt",
-    "labeling_data_v1": BASE_DIR / "models" / "elephant_v2_labeling_data_v1.pt",
     "labeling_data_v2_s": BASE_DIR / "models" / "elephant_v3_labeling_data_v2_s.pt",
     "labeling_data_v2_s_small": BASE_DIR / "models" / "elephant_v3_labeling_data_v2_s.pt",
     "labeling_data_v2_s_large": BASE_DIR / "models" / "elephant_v3_labeling_data_v2_s.pt",
@@ -448,11 +429,33 @@ def _center_distance_ratio(box_a: np.ndarray, box_b: np.ndarray) -> float:
     return (((ax - bx) ** 2 + (ay - by) ** 2) ** 0.5) / diag
 
 
+def _edge_anchor(
+    box: np.ndarray,
+    frame_w: int,
+    frame_h: int,
+) -> str:
+    # Border exits are one of the few reliable hints we get when an animal
+    # leaves the frame and reappears shortly after on the same side.
+    margin_x = max(72.0, frame_w * 0.08)
+    margin_y = max(54.0, frame_h * 0.08)
+    if float(box[0]) <= margin_x:
+        return "left"
+    if float(box[2]) >= max(frame_w - margin_x, 0):
+        return "right"
+    if float(box[1]) <= margin_y:
+        return "top"
+    if float(box[3]) >= max(frame_h - margin_y, 0):
+        return "bottom"
+    return ""
+
+
 def _resolve_canonical_track_id(
     raw_track_id: int,
     box: np.ndarray,
     cls_id: int,
     frame_index: int,
+    frame_w: int,
+    frame_h: int,
     raw_to_canonical: dict[int, int],
     canonical_last_seen: dict[int, dict[str, object]],
     used_canonical_in_frame: set[int],
@@ -461,10 +464,13 @@ def _resolve_canonical_track_id(
 ) -> tuple[int, int]:
     canonical = raw_to_canonical.get(raw_track_id)
     if canonical is not None:
+        if canonical in used_canonical_in_frame:
+            return -1, next_id
         return canonical, next_id
 
     best_id = None
     best_score = 0.0
+    current_edge = _edge_anchor(box, frame_w, frame_h)
     for candidate_id, meta in canonical_last_seen.items():
         if candidate_id in used_canonical_in_frame:
             continue
@@ -475,16 +481,19 @@ def _resolve_canonical_track_id(
         prev_box = np.array(meta["box"], dtype=np.float32)
         overlap = _iou(box, prev_box)
         center_dist = _center_distance_ratio(box, prev_box)
+        previous_edge = str(meta.get("edge_anchor") or "")
+        edge_reentry = bool(current_edge and current_edge == previous_edge)
         # Adjacent sampled frames can have larger camera displacement; allow looser
         # geometric gating only for very short gaps to reduce sudden late-video ID resets.
         short_gap = gap <= (FRAME_STRIDE * 3)
-        gate_iou = 0.02 if short_gap else RECONNECT_IOU_THRESHOLD
-        gate_center = 1.15 if short_gap else RECONNECT_CENTER_DISTANCE
+        gate_iou = 0.0 if edge_reentry else (0.02 if short_gap else RECONNECT_IOU_THRESHOLD)
+        gate_center = 1.45 if edge_reentry else (1.15 if short_gap else RECONNECT_CENTER_DISTANCE)
         if overlap < gate_iou and center_dist > gate_center:
             continue
         class_penalty = CLASS_MISMATCH_PENALTY if int(meta["cls_id"]) != cls_id else 0.0
         # Prefer larger overlap, then smaller center distance; mild penalty for class mismatch.
-        score = overlap + max(0.0, (gate_center - center_dist) * 0.25) - class_penalty
+        edge_bonus = 0.08 if edge_reentry else 0.0
+        score = overlap + max(0.0, (gate_center - center_dist) * 0.25) + edge_bonus - class_penalty
         if score > best_score:
             best_score = score
             best_id = candidate_id
@@ -531,25 +540,33 @@ def _recover_prev_frame_track_id(
 def _recover_tail_track_id(
     box: np.ndarray,
     cls_id: int,
+    frame_w: int,
+    frame_h: int,
     canonical_last_seen: dict[int, dict[str, object]],
     frame_index: int,
     used_canonical_in_frame: set[int],
 ) -> int | None:
     best_id = None
     best_score = 0.0
+    current_edge = _edge_anchor(box, frame_w, frame_h)
     for cid, meta in canonical_last_seen.items():
         if cid in used_canonical_in_frame:
             continue
         prev_box = np.array(meta["box"], dtype=np.float32)
         overlap = _iou(box, prev_box)
         center_dist = _center_distance_ratio(box, prev_box)
-        if overlap < TAIL_GUARD_IOU_RECOVER and center_dist > TAIL_GUARD_CENTER_RECOVER:
+        previous_edge = str(meta.get("edge_anchor") or "")
+        edge_reentry = bool(current_edge and current_edge == previous_edge)
+        gate_iou = 0.0 if edge_reentry else TAIL_GUARD_IOU_RECOVER
+        gate_center = 1.55 if edge_reentry else TAIL_GUARD_CENTER_RECOVER
+        if overlap < gate_iou and center_dist > gate_center:
             continue
         gap = frame_index - int(meta["frame_index"])
         if gap <= 0 or gap > RECONNECT_MAX_GAP_FRAMES * 2:
             continue
         class_penalty = CLASS_MISMATCH_PENALTY if int(meta["cls_id"]) != cls_id else 0.0
-        score = overlap + max(0.0, (TAIL_GUARD_CENTER_RECOVER - center_dist) * 0.2) - class_penalty
+        edge_bonus = 0.1 if edge_reentry else 0.0
+        score = overlap + max(0.0, (gate_center - center_dist) * 0.2) + edge_bonus - class_penalty
         if score > best_score:
             best_score = score
             best_id = cid
@@ -566,6 +583,7 @@ def _compact_display_id(
     canonical_last_seen: dict[int, dict[str, object]],
     canonical_to_display: dict[int, int],
     display_last_seen: dict[int, int],
+    used_display_in_frame: set[int] | None = None,
 ) -> int:
     # Release stale canonical->display bindings so small ID numbers can be reused.
     for cid in list(canonical_to_display.keys()):
@@ -578,10 +596,17 @@ def _compact_display_id(
 
     if canonical_id in canonical_to_display:
         display_id = canonical_to_display[canonical_id]
-        display_last_seen[display_id] = frame_index
-        return display_id
+        if used_display_in_frame is not None and display_id in used_display_in_frame:
+            canonical_to_display.pop(canonical_id, None)
+        else:
+            display_last_seen[display_id] = frame_index
+            if used_display_in_frame is not None:
+                used_display_in_frame.add(display_id)
+            return display_id
 
     used = set(canonical_to_display.values())
+    if used_display_in_frame is not None:
+        used |= set(used_display_in_frame)
     reusable = [
         did
         for did, last_frame in display_last_seen.items()
@@ -594,6 +619,8 @@ def _compact_display_id(
 
     canonical_to_display[canonical_id] = display_id
     display_last_seen[display_id] = frame_index
+    if used_display_in_frame is not None:
+        used_display_in_frame.add(display_id)
     return display_id
 
 
@@ -661,8 +688,8 @@ def _draw_detection_card(
     (tw, th), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, font_thickness)
     pad_x = max(8, int(round(10 * scale_ref)))
     pad_y = max(6, int(round(8 * scale_ref)))
-    tag_h = th + (pad_y * 2)
-    tag_w = tw + (pad_x * 2)
+    tag_h = th + (pad_y * 2) + text_outline_thickness
+    tag_w = tw + (pad_x * 2) + (text_outline_thickness * 2) + 4
 
     # Avoid label overlap in crowded scenes by shifting down in small steps.
     if occupied_tag_rects is None:
@@ -717,8 +744,8 @@ def _draw_detection_card(
             best_rect = candidate_rect
 
     if best_rect is None:
-        tag_x1 = x1
-        tag_y1 = max(0, y1 - tag_h - 6)
+        tag_x1 = int(np.clip(x1, 0, max_tag_x1))
+        tag_y1 = int(np.clip(y1 - tag_h - 6, 0, max_tag_y1))
         tag_x2 = min(frame_w - 1, tag_x1 + tag_w)
         tag_y2 = min(frame_h - 1, tag_y1 + tag_h)
     else:
@@ -729,8 +756,8 @@ def _draw_detection_card(
     cv2.rectangle(overlay, (tag_x1, tag_y1), (tag_x2, tag_y2), ID_TAG_BG, -1, cv2.LINE_AA)
     cv2.addWeighted(overlay, TAG_ALPHA, frame, 1.0 - TAG_ALPHA, 0, frame)
     cv2.rectangle(frame, (tag_x1, tag_y1), (tag_x2, tag_y2), ID_STROKE_COLOR, 1, cv2.LINE_AA)
-    text_x = tag_x1 + pad_x
-    text_y = tag_y2 - baseline - pad_y + 1
+    text_x = min(tag_x1 + pad_x + text_outline_thickness, max(0, frame_w - tw - 2))
+    text_y = tag_y2 - baseline - pad_y
     cv2.putText(
         frame,
         label,
@@ -1025,10 +1052,11 @@ def detect_image(image_path: Path, output_dir: Path, model_key: str | None = Non
         cls_id = int(det.get("cls_id", -1))
         age_tag = _format_age_label(det.get("cls_label"), cls_id)
         box = np.array([det["x1"], det["y1"], det["x2"], det["y2"]], dtype=np.float32)
+        image_label = f"ID {idx:02d}" if age_tag.startswith("Class ") or age_tag == "Unknown" else f"ID {idx:02d} | {age_tag}"
         _draw_detection_card(
             image,
             box=box,
-            label_text=f"ID {idx:02d} | {age_tag}",
+            label_text=image_label,
             color=_color_for_id(idx),
             occupied_tag_rects=occupied_tag_rects,
             avoid_rects=detection_rects,
@@ -1044,6 +1072,7 @@ def detect_and_annotate(
     output_dir: Path,
     model_key: str | None = None,
     pipeline_mode: str | None = None,
+    should_cancel: Callable[[], bool] | None = None,
 ) -> list[dict]:
     model_path = resolve_model_path(model_key)
 
@@ -1084,6 +1113,9 @@ def detect_and_annotate(
     canonical_to_display: dict[int, int] = {}
     display_last_seen: dict[int, int] = {}
     canonical_last_seen: dict[int, dict[str, object]] = {}
+    # Smooth age labels per identity so rendered tags do not flip on every
+    # slightly noisy single-frame classification.
+    canonical_age_votes: dict[int, dict[str, int]] = {}
     raw_bytetrack_ids_seen: set[int] = set()
     diag: dict[str, int] = {
         "frames_read": 0,
@@ -1113,6 +1145,8 @@ def detect_and_annotate(
     frame_index = 0
     end_of_stream = False
     while not end_of_stream:
+        if should_cancel and should_cancel():
+            raise RuntimeError("Processing cancelled")
         t_read = time.perf_counter()
         ret, frame = cap.read()
         read_total_s += time.perf_counter() - t_read
@@ -1176,6 +1210,9 @@ def detect_and_annotate(
             # while keeping the same sampled-frame cadence for tracking quality.
             skipped = 0
             for _ in range(max(stride - 1, 0)):
+                if should_cancel and should_cancel():
+                    end_of_stream = True
+                    raise RuntimeError("Processing cancelled")
                 if not cap.grab():
                     end_of_stream = True
                     break
@@ -1198,6 +1235,7 @@ def detect_and_annotate(
         frame_ids: list[int] = []
         frame_cls_ids: list[int] = []
         used_canonical_in_frame: set[int] = set()
+        used_display_in_frame: set[int] = set()
 
         occupied_tag_rects: list[tuple[int, int, int, int]] = []
         frame_detection_rects = [
@@ -1210,6 +1248,7 @@ def detect_and_annotate(
             for b in res.boxes
         ]
         if not run_use_tracker:
+            fast_tag_rects: list[tuple[int, int, int, int]] = []
             for box in res.boxes:
                 cls_id = int(box.cls[0]) if box.cls is not None else -1
                 conf = float(box.conf[0]) if box.conf is not None else 0.0
@@ -1229,11 +1268,13 @@ def detect_and_annotate(
                 )
                 if run_write_annotated:
                     t_annot = time.perf_counter()
-                    _draw_detection_lightweight(
+                    _draw_detection_card(
                         frame,
                         box=xyxy,
-                        label_text=f"Elephant {_format_age_label(names.get(cls_id), cls_id)}",
-                        color=(96, 165, 250),
+                        label_text=_format_age_label(names.get(cls_id), cls_id),
+                        color=ID_ACCENT_COLOR,
+                        occupied_tag_rects=fast_tag_rects,
+                        avoid_rects=frame_detection_rects,
                     )
                     frame_annotation_total_s += time.perf_counter() - t_annot
             if (frame_index % run_save_every_nth) == 0:
@@ -1247,6 +1288,9 @@ def detect_and_annotate(
             prev_cls_ids = []
             skipped = 0
             for _ in range(max(stride - 1, 0)):
+                if should_cancel and should_cancel():
+                    end_of_stream = True
+                    raise RuntimeError("Processing cancelled")
                 t_grab = time.perf_counter()
                 if not cap.grab():
                     grab_total_s += time.perf_counter() - t_grab
@@ -1275,12 +1319,16 @@ def detect_and_annotate(
                         box=xyxy,
                         cls_id=cls_id,
                         frame_index=frame_index,
+                        frame_w=int(frame.shape[1]),
+                        frame_h=int(frame.shape[0]),
                         raw_to_canonical=raw_to_canonical,
                         canonical_last_seen=canonical_last_seen,
                         used_canonical_in_frame=used_canonical_in_frame,
                         next_id=next_id,
                         diag=diag,
                     )
+                    if match_id == -1:
+                        match_id = None
                 except Exception:
                     match_id = None
 
@@ -1302,6 +1350,8 @@ def detect_and_annotate(
             if match_id is None:
                 best_iou = 0.0
                 for prev_box, prev_id in zip(prev_boxes, prev_ids):
+                    if prev_id in used_canonical_in_frame:
+                        continue
                     score = _iou(xyxy, prev_box)
                     if score > best_iou and score >= IOU_THRESHOLD:
                         best_iou = score
@@ -1326,6 +1376,8 @@ def detect_and_annotate(
                     tail_id = _recover_tail_track_id(
                         box=xyxy,
                         cls_id=cls_id,
+                        frame_w=int(frame.shape[1]),
+                        frame_h=int(frame.shape[0]),
                         canonical_last_seen=canonical_last_seen,
                         frame_index=frame_index,
                         used_canonical_in_frame=used_canonical_in_frame,
@@ -1351,15 +1403,28 @@ def detect_and_annotate(
                 canonical_last_seen=canonical_last_seen,
                 canonical_to_display=canonical_to_display,
                 display_last_seen=display_last_seen,
+                used_display_in_frame=used_display_in_frame,
             )
             frame_boxes.append(xyxy)
             frame_ids.append(match_id)
             frame_cls_ids.append(cls_id)
             used_canonical_in_frame.add(match_id)
+            age_votes = canonical_age_votes.setdefault(match_id, {})
+            age_label = _format_age_label(names.get(cls_id), cls_id)
+            if age_label != "Unknown":
+                age_votes[age_label] = int(age_votes.get(age_label, 0)) + 1
+            stable_age_label = age_label
+            if age_votes:
+                stable_age_label = max(
+                    age_votes.items(),
+                    key=lambda item: (item[1], item[0] == age_label, item[0] != "Unknown"),
+                )[0]
             canonical_last_seen[match_id] = {
                 "box": xyxy.tolist(),
                 "frame_index": frame_index,
                 "cls_id": cls_id,
+                "age_label": stable_age_label,
+                "edge_anchor": _edge_anchor(xyxy, int(frame.shape[1]), int(frame.shape[0])),
             }
 
             detections.append(
@@ -1382,7 +1447,7 @@ def detect_and_annotate(
                 _draw_detection_card(
                     frame,
                     box=xyxy,
-                    label_text=f"ID {display_id:02d} | {_format_age_label(names.get(cls_id), cls_id)}",
+                    label_text=f"ID {display_id:02d} | {stable_age_label}",
                     color=_color_for_id(display_id),
                     occupied_tag_rects=occupied_tag_rects,
                     avoid_rects=frame_detection_rects,
@@ -1401,6 +1466,9 @@ def detect_and_annotate(
         prev_cls_ids = frame_cls_ids
         skipped = 0
         for _ in range(max(stride - 1, 0)):
+            if should_cancel and should_cancel():
+                end_of_stream = True
+                raise RuntimeError("Processing cancelled")
             t_grab = time.perf_counter()
             if not cap.grab():
                 grab_total_s += time.perf_counter() - t_grab

@@ -25,7 +25,13 @@ def _extract_gps_points(path: Path, include_embedded: bool) -> list[tuple[float,
     ]
     if include_embedded:
         cmd.insert(1, "-ee")
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    except FileNotFoundError as exc:
+        raise RuntimeError(
+            "exiftool is not installed in the runtime environment. "
+            "Install exiftool or set EXIFTOOL_PATH to the correct executable."
+        ) from exc
     points: list[tuple[float, float, str | None]] = []
     assert proc.stdout is not None
     for line in proc.stdout:

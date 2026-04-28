@@ -28,6 +28,8 @@ def init_db() -> None:
                 video_path TEXT NOT NULL,
                 status TEXT NOT NULL,
                 message TEXT,
+                model_key TEXT,
+                pipeline_mode TEXT,
                 gpx_path TEXT,
                 processing_started_at TEXT,
                 processing_completed_at TEXT,
@@ -83,6 +85,10 @@ def init_db() -> None:
             conn.execute("ALTER TABLE jobs ADD COLUMN processing_started_at TEXT")
         if "processing_completed_at" not in job_cols:
             conn.execute("ALTER TABLE jobs ADD COLUMN processing_completed_at TEXT")
+        if "model_key" not in job_cols:
+            conn.execute("ALTER TABLE jobs ADD COLUMN model_key TEXT")
+        if "pipeline_mode" not in job_cols:
+            conn.execute("ALTER TABLE jobs ADD COLUMN pipeline_mode TEXT")
         cols = {row["name"] for row in conn.execute("PRAGMA table_info(detections)")}
         if "track_id" not in cols:
             conn.execute("ALTER TABLE detections ADD COLUMN track_id INTEGER")
@@ -101,7 +107,14 @@ def create_job(job_id: str, filename: str, video_path: str) -> None:
         )
 
 
-def update_job(job_id: str, status: str, message: str | None = None, gpx_path: str | None = None) -> None:
+def update_job(
+    job_id: str,
+    status: str,
+    message: str | None = None,
+    gpx_path: str | None = None,
+    model_key: str | None = None,
+    pipeline_mode: str | None = None,
+) -> None:
     now = _utc_now()
     with _connect() as conn:
         conn.execute(
@@ -109,20 +122,41 @@ def update_job(job_id: str, status: str, message: str | None = None, gpx_path: s
             UPDATE jobs
             SET status = ?,
                 message = ?,
+                model_key = COALESCE(?, model_key),
+                pipeline_mode = COALESCE(?, pipeline_mode),
                 gpx_path = COALESCE(?, gpx_path),
                 processing_started_at = CASE
                     WHEN ? = 'processing' THEN ?
                     ELSE processing_started_at
                 END,
                 processing_completed_at = CASE
-                    WHEN ? IN ('complete','failed') THEN ?
+                    WHEN ? IN ('complete','failed','cancelled') THEN ?
                     ELSE processing_completed_at
                 END,
                 updated_at = ?
             WHERE id = ?
             """,
-            (status, message, gpx_path, status, now, status, now, now, job_id),
+            (
+                status,
+                message,
+                model_key,
+                pipeline_mode,
+                gpx_path,
+                status,
+                now,
+                status,
+                now,
+                now,
+                job_id,
+            ),
         )
+
+
+def clear_job_data(job_id: str) -> None:
+    with _connect() as conn:
+        conn.execute("DELETE FROM gps_points WHERE job_id = ?", (job_id,))
+        conn.execute("DELETE FROM detections WHERE job_id = ?", (job_id,))
+        conn.execute("DELETE FROM habitat_frames WHERE job_id = ?", (job_id,))
 
 
 def insert_gps_points(job_id: str, points: list[tuple[float, float, str | None]]) -> None:
@@ -186,6 +220,7 @@ def get_jobs() -> list[dict]:
         rows = conn.execute(
             """
             SELECT id, filename, status, message,
+                   model_key, pipeline_mode,
                    processing_started_at, processing_completed_at,
                    created_at, updated_at
             FROM jobs
@@ -213,7 +248,7 @@ def get_jobs() -> list[dict]:
 def get_job(job_id: str) -> dict | None:
     with _connect() as conn:
         row = conn.execute(
-            "SELECT id, filename, video_path, status, message, gpx_path, created_at, updated_at FROM jobs WHERE id = ?",
+            "SELECT id, filename, video_path, status, message, model_key, pipeline_mode, gpx_path, created_at, updated_at FROM jobs WHERE id = ?",
             (job_id,),
         ).fetchone()
     return dict(row) if row else None

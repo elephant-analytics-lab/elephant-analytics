@@ -1,16 +1,7 @@
-streamlit
 fastapi
 uvicorn[standard]
-celery
+python-multipart
+python-dotenv
 opencv-python-headless
-ultralytics
 numpy
-pandas
-plotly
-altair
-matplotlib
-folium
-streamlit-folium
-requests          # streamlit frontend calls backend with requests.post(...)
-python-multipart  # FastAPI handling file uploads (video) needs this
-python-dotenv     # (optional) if you want to load .env configs
+ultralytics
