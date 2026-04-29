@@ -1,0 +1,11 @@
+ELEPHANT ANALYTICS
+
+1. Install and open Docker Desktop.
+2. Wait until Docker Desktop finishes starting.
+3. Double-click "Open Elephant Analytics.bat".
+4. Wait for the browser to open.
+5. When finished, double-click "Close Elephant Analytics.bat".
+
+If nothing opens:
+- Make sure Docker Desktop is running.
+- Then double-click "Open Elephant Analytics.bat" again.

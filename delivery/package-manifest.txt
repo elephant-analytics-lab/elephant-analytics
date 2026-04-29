@@ -1,0 +1,2 @@
+Included: backend, frontend source, active models, tiles, empty data dirs, docker compose, README, requirements, Open Elephant Analytics.bat, Close Elephant Analytics.bat.
+Excluded: streamlit, docs, .git, .venv, node_modules, frontend/dist, local sqlite db, uploaded media, generated outputs, legacy model weights.

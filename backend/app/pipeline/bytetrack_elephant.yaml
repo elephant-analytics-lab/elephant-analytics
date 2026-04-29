@@ -1,0 +1,17 @@
+tracker_type: bytetrack
+
+# Higher confidence for first association pass
+track_high_thresh: 0.45
+# Keep weak candidates for second-pass association
+track_low_thresh: 0.08
+# Require stronger evidence for spawning new IDs
+new_track_thresh: 0.50
+
+# Keep tracks alive longer through short occlusions/blur
+track_buffer: 180
+
+# Stricter matching helps reduce ID swaps in herds
+match_thresh: 0.85
+
+# Score fusion is generally more stable for crowded scenes
+fuse_score: true

@@ -1,0 +1,39 @@
+version: "3.9"
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: elephant-backend
+    working_dir: /app
+    command: uvicorn backend.app.main:app --host 0.0.0.0 --port 8000
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data
+      - ./models:/app/models
+      - ./runs:/app/runs
+      - ./backend:/app/backend
+    restart: unless-stopped
+
+  frontend-react:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+    container_name: elephant-frontend-react
+    ports:
+      - "8502:8501"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+  tileserver:
+    image: klokantech/tileserver-gl
+    container_name: elephant-tileserver
+    ports:
+      - "8080:80"
+    volumes:
+      - ./tiles:/data
+    command: ["tileserver-gl", "/data/malaysia_sg_z12.mbtiles"]
+    restart: unless-stopped

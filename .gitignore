@@ -1,0 +1,6 @@
+models/
+tiles/
+data/
+node_modules/
+backend/storage/
+.env
